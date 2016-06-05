@@ -1,0 +1,178 @@
+#include "globals.h"
+#include "maindialog.h"
+
+#include "netmanager.h"
+#include "eventline.h"
+#include "quotestableview.h"
+#include "quotestablemodel.h"
+#include "setupdialog.h"
+#include "statusbar.h"
+#include "scheduler.h"
+
+#include <QtWidgets>
+
+/* external routines */
+QPixmap qt_pixmapFromWinHICON(HICON icon);
+
+MainDialog::MainDialog() 
+    : q2t_(new Quotes2Time())
+{
+    Global::init();
+    setFixedSize(Global::desktop.width()*0.6f, Global::desktop.height()*0.5f);
+    netman_.reset(new NetworkManager(this));
+
+    setupButtons();
+    setupTable();
+    setupIndicator();
+    setupStatus();
+
+    setWindowTitle(Global::productFullName());
+}
+
+MainDialog::~MainDialog()
+{}
+
+void MainDialog::onStart()
+{
+    QTimer::singleShot(0, this, SLOT(asyncStart()));
+}
+
+void MainDialog::onStop()
+{
+    QTimer::singleShot(0, this, SLOT(asyncStop()));
+}
+
+void MainDialog::onSettings()
+{
+    SetupDialog(*netman_->model(), this).exec();
+}
+
+void MainDialog::onReconnectSetCheck(bool on)
+{
+    if( reconnectBox_ )
+        reconnectBox_->setChecked(on);
+}
+
+void MainDialog::onStateChanged(quint8 state, const QString& reason)
+{
+    QColor clr = BTN_RED;
+    if( state == EngineClosingState || state == ProgressState ) {
+        QCursor* ovrCur = QApplication::overrideCursor();
+        if( ovrCur == NULL || ovrCur->shape() != Qt::WaitCursor )
+            QApplication::setOverrideCursor(QCursor(Qt::WaitCursor));
+        clr = BTN_YELLOW;
+    }
+    if( state == EstablishState || state == EstablishWarnState ) {
+        QApplication::restoreOverrideCursor();
+        startButton_->setEnabled( false );
+        stopButton_->setEnabled( true );
+        clr = BTN_GREEN;
+    }
+    else {
+        QApplication::restoreOverrideCursor();
+        startButton_->setEnabled(true);
+        stopButton_->setEnabled(false);
+    }
+
+    QPalette pal;
+    pal.setColor(QPalette::Button, clr);
+    colorButton_->setPalette(pal);
+
+    if( state == ProgressState )
+        statusBar_->connecting(netman_->model()->value(ServerParam));
+    else if( state == ReconnectingState )
+        statusBar_->reconnecting();
+    else if( state == EstablishState || state == EstablishWarnState )
+        statusBar_->established(reason);
+    else if( state == ForcedClosingState)
+        statusBar_->loggedOut(reason);
+    else if( state == ClosedFailureState || state == ClosedRemoteState ) {
+        statusBar_->disconnected(reason);
+        netman_->reconnect();
+    }
+}
+
+void MainDialog::setupButtons()
+{
+    QRect rc = QFontMetrics(*Global::nativeBold).boundingRect(rc, Qt::TextWordWrap|Qt::AlignCenter,tr("Start"));
+    QObject::connect(startButton_ = new QPushButton(tr("Start"), this), SIGNAL(clicked()), this, SLOT(onStart()));
+    startButton_->setToolTip(tr("Login to LMAX or connection start\n(account settings can be configured in settings))"));
+    startButton_->setFont(*Global::buttons);
+    startButton_->setAutoDefault(false);
+    startButton_->setFixedSize(rc.width()*2, rc.height()*2);
+    startButton_->move(10,10);
+    startButton_->show();
+    
+    QObject::connect(stopButton_ = new QPushButton(tr("Stop"), this), SIGNAL(clicked()), this, SLOT(onStop()));
+    stopButton_->setToolTip(tr("Logout from LMAX or connection stop"));
+    stopButton_->setFont(*Global::buttons);
+    stopButton_->setFixedSize(rc.width()*2, rc.height()*2);
+    stopButton_->move(startButton_->pos().x()+startButton_->width()+10, 10);
+    stopButton_->setEnabled(false);
+    stopButton_->setAutoDefault(false);
+    stopButton_->show();
+
+    QPalette pal;
+    pal.setColor(QPalette::Button, BTN_RED);
+    colorButton_ = new QPushButton(NULL, this);
+    colorButton_->setToolTip(tr("\"Traffic light\" or connection state color"));
+    colorButton_->setFixedSize(rc.height()*2, rc.height()*2);
+    colorButton_->move(stopButton_->pos().x()+stopButton_->width()+10, 10);
+    colorButton_->setAutoDefault(false);
+    colorButton_->setPalette( pal );
+    colorButton_->show();
+
+    QObject::connect(reconnectBox_ = new QCheckBox(tr("Reconnect After Failure"), this), SIGNAL(stateChanged(int)), 
+                     netman_->scheduler(), SLOT(setReconnectEnabled(int)));
+    reconnectBox_->setToolTip(tr("Enable/disable auto-reconnecting after connection failures\nNote that the button takes off itself if disconnection was\nby reason of invalid connection settings,\nnot on server side,\nreceived exchange's logout message"));
+    reconnectBox_->setCheckState(Qt::Checked);
+    reconnectBox_->setFont(*Global::buttons);
+    reconnectBox_->move(colorButton_->pos().x()+colorButton_->width()+10, 10);
+    reconnectBox_->show();
+
+    QObject::connect(settingsButton_ = new QPushButton(NULL, this), SIGNAL(clicked()), this, SLOT(onSettings()));
+    settingsButton_->setFixedSize(rc.height()*2, rc.height()*2);
+    settingsButton_->setIconSize( QSize(colorButton_->width(), 
+                                        colorButton_->height()) );
+    settingsButton_->setIcon(QIcon( *Global::pxSettings ));
+
+    settingsButton_->move(width() - rc.height()*2 - 10, 10);
+    settingsButton_->setAutoDefault(false);
+}
+
+void MainDialog::setupTable()
+{
+    tableview_.reset(new QuotesTableView(this));
+    netman_->model()->resetView(tableview_.data());
+    tableview_->setFont(*Global::compact);
+    tableview_->setFixedSize(width()-20, height() - startButton_->height() - Global::desktop.height()*0.4);
+    tableview_->move(10, startButton_->height() + 20);
+    tableview_->show();
+    tableview_->updateStyles();
+    tableview_->setModel(netman_->model());
+}
+
+void MainDialog::setupIndicator()
+{
+    indicator_.reset(new EventLine(q2t_,this));
+    indicator_->setMinimumSize(width()-20, height() - startButton_->height() - tableview_->height() - 50);
+    indicator_->move(10, startButton_->height() + tableview_->height()+25);
+    indicator_->show();
+}
+
+void MainDialog::setupStatus()
+{
+    statusBar_ = new StatusBar(this);
+    statusBar_->setFixedSize(width()-20, 40);
+    statusBar_->move(10, startButton_->height() + tableview_->height() + indicator_->height() + 20);
+}
+
+void MainDialog::asyncStart()
+{
+    netman_->start();
+}
+
+void MainDialog::asyncStop()
+{
+    netman_->stop();
+}
